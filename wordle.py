@@ -60,17 +60,57 @@ def pattern_for(secret, guess):
 def refine_candidates(candidates, guess, pattern):
     return [w for w in candidates if pattern_for(w, guess) == pattern]
 
-def entropy_for_guess(guess, possible_answers):
-    total = len(possible_answers)
+def bucket_counts_for_guess(guess, possible_answers):
     counts = Counter()
     for ans in possible_answers:
-        p = pattern_for(ans, guess)
-        counts[p] += 1
+        counts[pattern_for(ans, guess)] += 1
+    return counts
+
+def entropy_from_counts(counts, total):
     H = 0.0
     for c in counts.values():
         p = c / total
         H -= p * math.log2(p)
     return H
+
+def entropy_for_guess(guess, possible_answers):
+    total = len(possible_answers)
+    counts = bucket_counts_for_guess(guess, possible_answers)
+    return entropy_from_counts(counts, total)
+
+def efficiency_for_guess(guess, possible_answers):
+    total = len(possible_answers)
+    if total <= 1:
+        return {
+            "H": 0.0,
+            "H_norm": 0.0,
+            "exp_left": float(total),
+            "exp_elim": 0.0,
+            "exp_reduction": 0.0,
+            "worst_left": total,
+            "best_left": total,
+            "n_buckets": 1,
+        }
+
+    counts = bucket_counts_for_guess(guess, possible_answers)
+    H = entropy_from_counts(counts, total)
+    exp_left = sum(c * c for c in counts.values()) / total
+    exp_elim = total - exp_left
+    exp_reduction = 1.0 - (exp_left / total)
+    worst_left = max(counts.values()) if counts else total
+    best_left = min(counts.values()) if counts else total
+    H_norm = H / math.log2(total) if total > 1 else 0.0
+
+    return {
+        "H": H,
+        "H_norm": H_norm,
+        "exp_left": exp_left,
+        "exp_elim": exp_elim,
+        "exp_reduction": exp_reduction,
+        "worst_left": worst_left,
+        "best_left": best_left,
+        "n_buckets": len(counts),
+    }
 
 def _entropy_worker(guess):
     return guess, entropy_for_guess(guess, _ENTROPY_CANDIDATES)
@@ -222,9 +262,19 @@ def mode_manual_assist(allowed_words, max_guesses, entropy_cache_path, n_jobs):
                 n_jobs=n_jobs,
                 progress_label="[manual entropy]",
             )
+
         for H, w in top10:
             mark = "*" if w in cands else ""
-            print(f"{w}{mark}: {H:.4f}")
+            eff = efficiency_for_guess(w, cands)
+            print(
+                f"{w}{mark}: "
+                f"H={eff['H']:.4f} "
+                f"norm={eff['H_norm']:.3f} "
+                f"Eleft={eff['exp_left']:.1f} "
+                f"worst={eff['worst_left']} "
+                f"red={eff['exp_reduction']*100:.1f}% "
+                f"buckets={eff['n_buckets']}"
+            )
 
         if guess_count >= max_guesses:
             print("\nReached max guesses (Wordle would be lost)")

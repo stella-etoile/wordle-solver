@@ -46,19 +46,94 @@ def pattern_for(secret, guess):
 def refine_candidates(candidates, guess, pattern):
     return [w for w in candidates if pattern_for(w, guess) == pattern]
 
-def entropy_for_guess(guess, possible_answers):
-    total = len(possible_answers)
-    if total <= 1:
-        return 0.0
+def bucket_counts_for_guess(guess, possible_answers):
     counts = Counter()
     for ans in possible_answers:
-        p = pattern_for(ans, guess)
-        counts[p] += 1
+        counts[pattern_for(ans, guess)] += 1
+    return counts
+
+def entropy_from_counts(counts, total):
     H = 0.0
     for c in counts.values():
         p = c / total
         H -= p * math.log2(p)
     return H
+
+def entropy_for_guess(guess, possible_answers):
+    total = len(possible_answers)
+    if total <= 1:
+        return 0.0
+    counts = bucket_counts_for_guess(guess, possible_answers)
+    return entropy_from_counts(counts, total)
+
+def efficiency_for_guess(guess, possible_answers):
+    total = len(possible_answers)
+    if total <= 1:
+        return {
+            "H": 0.0,
+            "H_norm": 0.0,
+            "exp_left": float(total),
+            "exp_elim": 0.0,
+            "exp_reduction": 0.0,
+            "worst_left": total,
+            "best_left": total,
+            "n_buckets": 1,
+        }
+
+    counts = bucket_counts_for_guess(guess, possible_answers)
+    H = entropy_from_counts(counts, total)
+    exp_left = sum(c * c for c in counts.values()) / total
+    exp_elim = total - exp_left
+    exp_reduction = 1.0 - (exp_left / total)
+    worst_left = max(counts.values()) if counts else total
+    best_left = min(counts.values()) if counts else total
+    H_norm = H / math.log2(total) if total > 1 else 0.0
+
+    return {
+        "H": H,
+        "H_norm": H_norm,
+        "exp_left": exp_left,
+        "exp_elim": exp_elim,
+        "exp_reduction": exp_reduction,
+        "worst_left": worst_left,
+        "best_left": best_left,
+        "n_buckets": len(counts),
+    }
+
+def quordle_efficiency_for_guess(guess, cands_list, active):
+    out = {"boards": [], "sum_H": 0.0, "sum_exp_left": 0.0, "sum_exp_elim": 0.0}
+    sum_exp_reduction = 0.0
+    max_worst = 0
+    min_best = None
+    sum_buckets = 0
+    sum_H_norm = 0.0
+    active_count = 0
+
+    for i in range(4):
+        if not active[i]:
+            out["boards"].append(None)
+            continue
+        eff = efficiency_for_guess(guess, cands_list[i])
+        out["boards"].append(eff)
+        out["sum_H"] += eff["H"]
+        out["sum_exp_left"] += eff["exp_left"]
+        out["sum_exp_elim"] += eff["exp_elim"]
+        sum_exp_reduction += eff["exp_reduction"]
+        sum_buckets += eff["n_buckets"]
+        sum_H_norm += eff["H_norm"]
+        active_count += 1
+        if eff["worst_left"] > max_worst:
+            max_worst = eff["worst_left"]
+        if min_best is None or eff["best_left"] < min_best:
+            min_best = eff["best_left"]
+
+    out["avg_H_norm"] = (sum_H_norm / active_count) if active_count > 0 else 0.0
+    out["avg_exp_reduction"] = (sum_exp_reduction / active_count) if active_count > 0 else 0.0
+    out["max_worst_left"] = max_worst
+    out["min_best_left"] = min_best if min_best is not None else 0
+    out["sum_buckets"] = sum_buckets
+    out["active_boards"] = active_count
+    return out
 
 def _init_entropy_state(state):
     global _ENTROPY_STATE
@@ -119,7 +194,9 @@ def ensure_first_entropy_cache(path, allowed_words, n_jobs):
         initializer=_init_entropy_state,
         initargs=({"cands_list": [allowed_words], "active": [True]},),
     ) as pool:
-        for i, (w, H) in enumerate(pool.imap_unordered(lambda g: (g, entropy_for_guess(g, allowed_words)), allowed_words), 1):
+        for i, (w, H) in enumerate(
+            pool.imap_unordered(lambda g: (g, entropy_for_guess(g, allowed_words)), allowed_words), 1
+        ):
             ent[w] = H
             last_msg = _print_progress_inline("[first entropy]", i, total, last_msg)
 
@@ -256,7 +333,17 @@ def mode_quordle_manual_assist(allowed_words, max_guesses, entropy_cache_path, n
                 if active[b] and w in cands_list[b]:
                     mark = "*"
                     break
-            print(f"{w}{mark}: {H:.4f}")
+
+            qeff = quordle_efficiency_for_guess(w, cands_list, active)
+            print(
+                f"{w}{mark}: "
+                f"Hsum={qeff['sum_H']:.4f} "
+                f"avgNorm={qeff['avg_H_norm']:.3f} "
+                f"EleftSum={qeff['sum_exp_left']:.1f} "
+                f"worstMax={qeff['max_worst_left']} "
+                f"avgRed={qeff['avg_exp_reduction']*100:.1f}% "
+                f"bucketsSum={qeff['sum_buckets']}"
+            )
 
         if guess_count >= max_guesses:
             print("\nReached max guesses (Quordle would be lost)")
