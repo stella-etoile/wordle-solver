@@ -40,7 +40,7 @@ You play in your browser/app, then copy the feedback patterns into the CLI to na
 ## Note
 
 1. Change the word list in `dictionary.txt` to input a different set of words
-2. Delete `first_guess_entropies.txt` if you want to force a rebuild.\
+2. Delete `first_guess_entropies.txt` if you want to force a rebuild.
 
 ---
 
