@@ -1,4 +1,4 @@
-# Wordle / Quordle / Octordle Entropy Helper (CLI)
+# Wordle / Quordle / Octordle Entropy Solver
 
 A small command-line helper that suggests strong guesses using **Shannon entropy** (information gain).  
 Works in three modes/scripts:
