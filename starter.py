@@ -6,9 +6,12 @@ import os
 import multiprocessing as mp
 import csv
 import time
+from datetime import datetime
+import json
 
 _ENTROPY_ANSWERS = None
 _JOINT_ANSWERS = None
+
 
 def tfmt(sec):
     if sec < 1:
@@ -18,6 +21,7 @@ def tfmt(sec):
     m = int(sec // 60)
     s = sec % 60
     return f"{m}m{s:.0f}s"
+
 
 def load_words(path):
     words = []
@@ -33,6 +37,7 @@ def load_words(path):
         if len(w) != length:
             raise ValueError("All words in dictionary must have same length")
     return words
+
 
 def pattern_for(secret, guess):
     n = len(secret)
@@ -53,6 +58,7 @@ def pattern_for(secret, guess):
                 secret_chars[idx] = None
     return "".join(str(x) for x in result)
 
+
 def entropy_for_guess(guess, possible_answers):
     total = len(possible_answers)
     counts = Counter()
@@ -64,6 +70,7 @@ def entropy_for_guess(guess, possible_answers):
         p = c / total
         H -= p * math.log2(p)
     return H
+
 
 def joint_entropy(sequence, answers):
     total = len(answers)
@@ -77,13 +84,16 @@ def joint_entropy(sequence, answers):
         H -= p * math.log2(p)
     return H
 
+
 def _entropy_init(answers):
     global _ENTROPY_ANSWERS
     _ENTROPY_ANSWERS = answers
 
+
 def _entropy_worker(w):
     H = entropy_for_guess(w, _ENTROPY_ANSWERS)
     return w, H
+
 
 def compute_single_entropies(guesses, answers, n_jobs, label="[H1]"):
     scores = []
@@ -112,6 +122,7 @@ def compute_single_entropies(guesses, answers, n_jobs, label="[H1]"):
     scores.sort(reverse=True)
     return scores
 
+
 def load_precomputed_entropies(path, allowed):
     mapping = {}
     with open(path, "r", encoding="utf-8") as f:
@@ -137,6 +148,7 @@ def load_precomputed_entropies(path, allowed):
             missing.append(w)
     scores.sort(reverse=True)
     return scores, missing
+
 
 def get_single_entropies(allowed, answers, n_jobs, first_entropy_file=None):
     if first_entropy_file is None:
@@ -165,15 +177,56 @@ def get_single_entropies(allowed, answers, n_jobs, first_entropy_file=None):
     ent_dict = {w: H for H, w in all_scores}
     return all_scores, ent_dict
 
+
 def _joint_init(answers):
     global _JOINT_ANSWERS
     _JOINT_ANSWERS = answers
+
 
 def _joint_worker(args):
     base_seq, new_word = args
     seq = list(base_seq) + [new_word]
     H = joint_entropy(seq, _JOINT_ANSWERS)
     return H, tuple(seq)
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def write_level_csv(out_dir, L, level, meta=None):
+    ensure_dir(out_dir)
+    path = os.path.join(out_dir, f"L{L:02d}_beam.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "entropy_bits", "sequence"])
+        for i, (H, seq) in enumerate(level, 1):
+            w.writerow([i, f"{H:.6f}", " ".join(seq)])
+    if meta is not None:
+        mpath = os.path.join(out_dir, f"L{L:02d}_meta.json")
+        with open(mpath, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+    return path
+
+
+def write_run_meta(out_dir, meta):
+    ensure_dir(out_dir)
+    path = os.path.join(out_dir, "run_meta.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+    return path
+
+
+def write_candidates(out_dir, candidate_words, ent_dict):
+    ensure_dir(out_dir)
+    path = os.path.join(out_dir, "candidates.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "word", "H1_bits"])
+        for i, word in enumerate(candidate_words, 1):
+            w.writerow([i, word, f"{ent_dict.get(word, float('nan')):.6f}"])
+    return path
+
 
 def search_best_starters(
     allowed_words,
@@ -184,18 +237,62 @@ def search_best_starters(
     top_print,
     n_jobs,
     first_entropy_file,
+    out_dir=None,
+    out_prefix=None,
+    save_top_print_only=False,
 ):
+    run_start = time.time()
     single_entropies, ent_dict = get_single_entropies(allowed_words, answers, n_jobs, first_entropy_file)
     candidate_words = [w for _, w in single_entropies[:top_m_words]]
+
+    save_dir = None
+    if out_dir is not None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = out_prefix or f"search_M{top_m_words}_B{beam_width}_L{max_len}_{ts}"
+        save_dir = os.path.join(out_dir, name)
+        ensure_dir(save_dir)
+        write_run_meta(
+            save_dir,
+            {
+                "dictionary_size": len(allowed_words),
+                "answers_size": len(answers),
+                "max_len": max_len,
+                "top_m_words": top_m_words,
+                "beam_width": beam_width,
+                "top_print": top_print,
+                "n_jobs": n_jobs,
+                "first_entropy_file": first_entropy_file,
+                "started_epoch": int(time.time()),
+            },
+        )
+        write_candidates(save_dir, candidate_words, ent_dict)
+
     level = []
     for H, w in single_entropies:
-        if w in candidate_words:
+        if w in set(candidate_words):
             level.append((H, [w]))
     level.sort(reverse=True)
     level = level[:beam_width]
+
     print("\n=== Best 1-word starters ===")
     for H, seq in level[:top_print]:
         print(f"{' '.join(seq)}: {H:.6f} bits")
+
+    if save_dir is not None:
+        to_save = level[:top_print] if save_top_print_only else level
+        write_level_csv(
+            save_dir,
+            1,
+            to_save,
+            meta={
+                "L": 1,
+                "beam_saved": len(to_save),
+                "beam_width": beam_width,
+                "top_m_words": top_m_words,
+                "elapsed_sec": round(time.time() - run_start, 6),
+            },
+        )
+
     for L in range(2, max_len + 1):
         print(f"\nSearching best {L}-word starters...")
         tasks = []
@@ -209,6 +306,7 @@ def search_best_starters(
         if total == 0:
             print("No expansions possible.")
             break
+
         new_level = []
         start = time.time()
         if n_jobs <= 1:
@@ -230,20 +328,60 @@ def search_best_starters(
                         eta = (elapsed / i) * (total - i) if i > 0 else 0
                         print(f"\r[L{L}] {i}/{total} | elapsed {tfmt(elapsed)} | ETA {tfmt(eta)}", end="", flush=True)
             print()
+
         new_level.sort(reverse=True)
         level = new_level[:beam_width]
+
         print(f"\n=== Best {L}-word starters ===")
         for H, seq in level[:top_print]:
             print(f"{' '.join(seq)}: {H:.6f} bits")
+
+        if save_dir is not None:
+            to_save = level[:top_print] if save_top_print_only else level
+            write_level_csv(
+                save_dir,
+                L,
+                to_save,
+                meta={
+                    "L": L,
+                    "tasks": total,
+                    "beam_saved": len(to_save),
+                    "beam_width": beam_width,
+                    "top_m_words": top_m_words,
+                    "elapsed_sec_level": round(time.time() - start, 6),
+                    "elapsed_sec_total": round(time.time() - run_start, 6),
+                },
+            )
+
+    if save_dir is not None:
+        write_run_meta(
+            save_dir,
+            {
+                "dictionary_size": len(allowed_words),
+                "answers_size": len(answers),
+                "max_len": max_len,
+                "top_m_words": top_m_words,
+                "beam_width": beam_width,
+                "top_print": top_print,
+                "n_jobs": n_jobs,
+                "first_entropy_file": first_entropy_file,
+                "finished_epoch": int(time.time()),
+                "total_elapsed_sec": round(time.time() - run_start, 6),
+            },
+        )
+        print(f"\nSaved run state to: {save_dir}")
+
 
 def _pair_init(answers):
     global _JOINT_ANSWERS
     _JOINT_ANSWERS = answers
 
+
 def _pair_worker(args):
     first, second = args
     H = joint_entropy([first, second], _JOINT_ANSWERS)
     return first, second, H
+
 
 def exhaustive_pair_search(allowed_words, answers, top_m_words, out_csv, n_jobs, pair_dissimilar_only, max_overlap, first_entropy_file):
     single_entropies, ent_dict = get_single_entropies(allowed_words, answers, n_jobs, first_entropy_file)
@@ -298,6 +436,7 @@ def exhaustive_pair_search(allowed_words, answers, top_m_words, out_csv, n_jobs,
             w.writerow([first, second, f"{H:.6f}", f"{H1:.6f}", f"{H2:.6f}"])
     print(f"\nWrote CSV: {out_csv}")
 
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dictionary", default="dictionary.txt")
@@ -313,10 +452,15 @@ def main():
     p.add_argument("--pair-dissimilar-only", action="store_true")
     p.add_argument("--max-overlap", type=int, default=2)
     p.add_argument("--first-entropy-file", default=None)
+    p.add_argument("--save-dir", default=None)
+    p.add_argument("--save-prefix", default=None)
+    p.add_argument("--save-top-only", action="store_true")
     args = p.parse_args()
+
     allowed = load_words(args.dictionary)
     answers = load_words(args.answers) if args.answers else allowed
     n_jobs = args.n_jobs or (os.cpu_count() or 1)
+
     if args.mode == "search":
         search_best_starters(
             allowed_words=allowed,
@@ -327,6 +471,9 @@ def main():
             top_print=args.top_print,
             n_jobs=n_jobs,
             first_entropy_file=args.first_entropy_file,
+            out_dir=args.save_dir,
+            out_prefix=args.save_prefix,
+            save_top_print_only=args.save_top_only,
         )
     elif args.mode == "eval":
         if not args.starter:
@@ -351,6 +498,7 @@ def main():
             max_overlap=args.max_overlap,
             first_entropy_file=args.first_entropy_file,
         )
+
 
 if __name__ == "__main__":
     main()
