@@ -24,9 +24,6 @@ def load_words(path):
             raise ValueError("All words in dictionary must have same length")
     return words
 
-def clear_screen():
-    os.system("cls" if os.name == "nt" else "clear")
-
 def pattern_for(secret, guess):
     n = len(secret)
     result = [0] * n
@@ -325,9 +322,6 @@ def mode_octordle_manual_assist(allowed_words, max_guesses, entropy_cache_path, 
     first_ent = None
 
     while True:
-        clear_screen()
-        print("=== OCTORDLE MANUAL ASSIST ===")
-        print(f"Guesses used: {guess_count}/{max_guesses}")
         print()
         print_multi_state(cands_list, active)
 
@@ -404,7 +398,6 @@ def mode_octordle_manual_assist(allowed_words, max_guesses, entropy_cache_path, 
         parts = line.split()
         if len(parts) != 1 + n_boards:
             print(f"Format: guess " + " ".join([f"p{i+1}" for i in range(n_boards)]))
-            input("Press Enter to continue...")
             continue
 
         guess = parts[0]
@@ -412,11 +405,9 @@ def mode_octordle_manual_assist(allowed_words, max_guesses, entropy_cache_path, 
 
         if len(guess) != word_len:
             print("Invalid guess length.")
-            input("Press Enter to continue...")
             continue
         if guess not in allowed_words:
             print("Guess not in dictionary.")
-            input("Press Enter to continue...")
             continue
 
         ok = True
@@ -428,7 +419,6 @@ def mode_octordle_manual_assist(allowed_words, max_guesses, entropy_cache_path, 
                 break
         if not ok:
             print("Invalid patterns. Each must be 0/1/2 of word length, or '-' to skip.")
-            input("Press Enter to continue...")
             continue
 
         guess_count += 1
@@ -446,7 +436,6 @@ def mode_octordle_manual_assist(allowed_words, max_guesses, entropy_cache_path, 
             cands_list[b] = refine_candidates(cands_list[b], guess, p)
             if not cands_list[b]:
                 print(f"{_fmt_board(b)} no candidates remain; something inconsistent.")
-                input("Press Enter to exit...")
                 return
 
 def main():

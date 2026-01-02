@@ -278,6 +278,21 @@ def top_quordle_entropy_guesses(
     scores.sort(reverse=True)
     return scores[:k] if k < len(scores) else scores
 
+def singleton_candidates_quordle(cands_list, active):
+    word_to_boards = {}
+    for i in range(4):
+        if not active[i]:
+            continue
+        c = cands_list[i]
+        if len(c) == 1:
+            w = c[0]
+            if w not in word_to_boards:
+                word_to_boards[w] = []
+            word_to_boards[w].append(i)
+    items = [(w, boards) for w, boards in word_to_boards.items()]
+    items.sort(key=lambda x: (len(x[1]), x[0]), reverse=True)
+    return items
+
 def _fmt_board(i):
     return f"[{i+1}]"
 
@@ -308,6 +323,26 @@ def mode_quordle_manual_assist(allowed_words, max_guesses, entropy_cache_path, n
         if not any(active):
             print("\nAll 4 boards solved!")
             return
+
+        singles = singleton_candidates_quordle(cands_list, active)
+        if singles:
+            print("\nGuaranteed answers available (boards with exactly 1 candidate):")
+            ranked = []
+            for w, boards in singles:
+                qeff = quordle_efficiency_for_guess(w, cands_list, active)
+                ranked.append((qeff["sum_H"], w, boards, qeff))
+            ranked.sort(reverse=True, key=lambda x: x[0])
+            for Hsum, w, boards, qeff in ranked:
+                btxt = ",".join(str(i + 1) for i in boards)
+                print(
+                    f"{w} -> solves [{btxt}]: "
+                    f"Hsum={qeff['sum_H']:.4f} "
+                    f"avgNorm={qeff['avg_H_norm']:.3f} "
+                    f"EleftSum={qeff['sum_exp_left']:.1f} "
+                    f"worstMax={qeff['max_worst_left']} "
+                    f"avgRed={qeff['avg_exp_reduction']*100:.1f}% "
+                    f"bucketsSum={qeff['sum_buckets']}"
+                )
 
         print("\nTop high-entropy words (sum across unsolved boards):")
         if guess_count == 0:
