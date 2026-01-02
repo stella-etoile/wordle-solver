@@ -298,6 +298,21 @@ def print_multi_state(cands_list, active, show=40):
         else:
             print(f"{tag} " + " ".join(c[:show]))
 
+def singleton_candidates(cands_list, active):
+    word_to_boards = {}
+    for i in range(len(cands_list)):
+        if not active[i]:
+            continue
+        c = cands_list[i]
+        if len(c) == 1:
+            w = c[0]
+            if w not in word_to_boards:
+                word_to_boards[w] = []
+            word_to_boards[w].append(i)
+    items = [(w, boards) for w, boards in word_to_boards.items()]
+    items.sort(key=lambda x: (len(x[1]), x[0]), reverse=True)
+    return items
+
 def mode_octordle_manual_assist(allowed_words, max_guesses, entropy_cache_path, n_jobs):
     n_boards = 8
     word_len = len(allowed_words[0])
@@ -313,6 +328,26 @@ def mode_octordle_manual_assist(allowed_words, max_guesses, entropy_cache_path, 
         if not any(active):
             print("\nAll boards solved!")
             return
+
+        singles = singleton_candidates(cands_list, active)
+        if singles:
+            print("\nGuaranteed answers available (boards with exactly 1 candidate):")
+            ranked = []
+            for w, boards in singles:
+                meff = multi_efficiency_for_guess(w, cands_list, active)
+                ranked.append((meff["sum_H"], w, boards, meff))
+            ranked.sort(reverse=True, key=lambda x: x[0])
+            for Hsum, w, boards, meff in ranked:
+                btxt = ",".join(str(i + 1) for i in boards)
+                print(
+                    f"{w} -> solves [{btxt}]: "
+                    f"Hsum={meff['sum_H']:.4f} "
+                    f"avgNorm={meff['avg_H_norm']:.3f} "
+                    f"EleftSum={meff['sum_exp_left']:.1f} "
+                    f"worstMax={meff['max_worst_left']} "
+                    f"avgRed={meff['avg_exp_reduction']*100:.1f}% "
+                    f"bucketsSum={meff['sum_buckets']}"
+                )
 
         print("\nTop high-entropy words (sum across unsolved boards):")
         if guess_count == 0:
