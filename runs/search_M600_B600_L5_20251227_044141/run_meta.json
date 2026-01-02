@@ -1,0 +1,11 @@
+{
+  "answers_size": 15921,
+  "beam_width": 600,
+  "dictionary_size": 15921,
+  "first_entropy_file": null,
+  "max_len": 5,
+  "n_jobs": 24,
+  "started_epoch": 1766832101,
+  "top_m_words": 600,
+  "top_print": 25
+}

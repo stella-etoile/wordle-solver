@@ -1,0 +1,13 @@
+{
+  "answers_size": 15921,
+  "beam_width": 2500,
+  "dictionary_size": 15921,
+  "finished_epoch": 1766876721,
+  "first_entropy_file": null,
+  "max_len": 3,
+  "n_jobs": 24,
+  "top_m_words": 5000,
+  "top_print": 25,
+  "total_elapsed_sec": 6110.48405,
+  "use_ram_cache": true
+}

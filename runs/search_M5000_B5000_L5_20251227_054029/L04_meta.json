@@ -1,0 +1,10 @@
+{
+  "L": 4,
+  "beam_saved": 5000,
+  "beam_width": 5000,
+  "elapsed_sec_level": 8870.565664,
+  "elapsed_sec_total": 20990.28852,
+  "tasks": 24985000,
+  "top_m_words": 5000,
+  "use_ram_cache": true
+}
