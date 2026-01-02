@@ -9,8 +9,15 @@ import time
 from datetime import datetime
 import json
 
+# ----------------------------
+# Globals for multiprocessing
+# ----------------------------
 _ENTROPY_ANSWERS = None
-_JOINT_ANSWERS = None
+
+# For joint entropy with RAM cache
+_PATTERNS = None          # list[bytearray], shape: [num_candidates][num_answers], values 0..242
+_PAT_BASE = 243           # 3^word_length for 5-letter wordle = 243
+_NUM_ANSWERS = None
 
 
 def tfmt(sec):
@@ -39,7 +46,11 @@ def load_words(path):
     return words
 
 
+# ----------------------------
+# Pattern computation
+# ----------------------------
 def pattern_for(secret, guess):
+    """Returns '0/1/2' string like '20110' (kept for compatibility)."""
     n = len(secret)
     result = [0] * n
     secret_chars = list(secret)
@@ -59,6 +70,42 @@ def pattern_for(secret, guess):
     return "".join(str(x) for x in result)
 
 
+def pattern_id_for(secret, guess):
+    """
+    Returns pattern encoded as base-3 integer in [0, 3^n).
+    For n=5, range is 0..242. This is much faster to count than strings.
+    """
+    n = len(secret)
+    res = [0] * n
+    secret_chars = list(secret)
+    guess_chars = list(guess)
+
+    # greens
+    for i in range(n):
+        if guess_chars[i] == secret_chars[i]:
+            res[i] = 2
+            secret_chars[i] = None
+            guess_chars[i] = None
+
+    # yellows
+    for i in range(n):
+        if guess_chars[i] is not None:
+            ch = guess_chars[i]
+            # linear search over 5 letters is fine
+            if ch in secret_chars:
+                res[i] = 1
+                secret_chars[secret_chars.index(ch)] = None
+
+    # base-3 encode (left-to-right)
+    x = 0
+    for d in res:
+        x = x * 3 + d
+    return x
+
+
+# ----------------------------
+# Entropy scoring
+# ----------------------------
 def entropy_for_guess(guess, possible_answers):
     total = len(possible_answers)
     counts = Counter()
@@ -73,6 +120,7 @@ def entropy_for_guess(guess, possible_answers):
 
 
 def joint_entropy(sequence, answers):
+    # Slow path (kept for eval mode and fallback)
     total = len(answers)
     counts = Counter()
     for ans in answers:
@@ -81,6 +129,60 @@ def joint_entropy(sequence, answers):
     H = 0.0
     for c in counts.values():
         p = c / total
+        H -= p * math.log2(p)
+    return H
+
+
+# ----------------------------
+# Fast joint entropy using RAM cache (pattern_id table)
+# ----------------------------
+def precompute_candidate_patterns(answers, candidate_words):
+    """
+    Build patterns table for (candidate_words x answers) where each entry is a uint8 (0..242).
+    Memory: len(candidate_words) * len(answers) bytes (≈ 9.6MB for 600x15921).
+    """
+    A = len(answers)
+    patterns = [bytearray(A) for _ in range(len(candidate_words))]
+    t0 = time.time()
+    for wi, w in enumerate(candidate_words):
+        row = patterns[wi]
+        for ai, ans in enumerate(answers):
+            row[ai] = pattern_id_for(ans, w)
+        # lightweight progress
+        if (wi + 1) % 25 == 0 or (wi + 1) == len(candidate_words):
+            elapsed = time.time() - t0
+            eta = (elapsed / (wi + 1)) * (len(candidate_words) - (wi + 1)) if wi + 1 else 0
+            print(
+                f"\r[cache] {wi+1}/{len(candidate_words)} | elapsed {tfmt(elapsed)} | ETA {tfmt(eta)}",
+                end="",
+                flush=True,
+            )
+    print()
+    return patterns
+
+
+def joint_entropy_cached(seq_indices):
+    """
+    seq_indices: tuple/list of candidate indices
+    Uses global _PATTERNS (candidate x answers) with uint8 values (0..242).
+    Encodes the multi-guess pattern key as a single integer in base 243 to avoid tuple allocation.
+    """
+    patterns = _PATTERNS
+    total = _NUM_ANSWERS
+    L = len(seq_indices)
+
+    counts = {}
+    # Iterate answers, compute base-243 key
+    for ai in range(total):
+        k = 0
+        for idx in seq_indices:
+            k = k * _PAT_BASE + patterns[idx][ai]
+        counts[k] = counts.get(k, 0) + 1
+
+    H = 0.0
+    inv_total = 1.0 / total
+    for c in counts.values():
+        p = c * inv_total
         H -= p * math.log2(p)
     return H
 
@@ -178,16 +280,17 @@ def get_single_entropies(allowed, answers, n_jobs, first_entropy_file=None):
     return all_scores, ent_dict
 
 
-def _joint_init(answers):
-    global _JOINT_ANSWERS
-    _JOINT_ANSWERS = answers
+def _joint_init_cached(patterns, num_answers):
+    global _PATTERNS, _NUM_ANSWERS
+    _PATTERNS = patterns
+    _NUM_ANSWERS = num_answers
 
 
-def _joint_worker(args):
-    base_seq, new_word = args
-    seq = list(base_seq) + [new_word]
-    H = joint_entropy(seq, _JOINT_ANSWERS)
-    return H, tuple(seq)
+def _joint_worker_cached(args):
+    base_idx_seq, new_idx = args
+    seq = tuple(base_idx_seq) + (new_idx,)
+    H = joint_entropy_cached(seq)
+    return H, seq
 
 
 def ensure_dir(path):
@@ -240,11 +343,15 @@ def search_best_starters(
     out_dir=None,
     out_prefix=None,
     save_top_print_only=False,
+    use_ram_cache=True,
 ):
     run_start = time.time()
     single_entropies, ent_dict = get_single_entropies(allowed_words, answers, n_jobs, first_entropy_file)
-    candidate_words = [w for _, w in single_entropies[:top_m_words]]
 
+    candidate_words = [w for _, w in single_entropies[:top_m_words]]
+    word_to_cidx = {w: i for i, w in enumerate(candidate_words)}
+
+    # Save setup
     save_dir = None
     if out_dir is not None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -262,14 +369,33 @@ def search_best_starters(
                 "top_print": top_print,
                 "n_jobs": n_jobs,
                 "first_entropy_file": first_entropy_file,
+                "use_ram_cache": use_ram_cache,
                 "started_epoch": int(time.time()),
             },
         )
         write_candidates(save_dir, candidate_words, ent_dict)
 
+    # ----------------------------
+    # RAM cache: precompute patterns for candidate words against all answers
+    # ----------------------------
+    patterns = None
+    if use_ram_cache:
+        print(f"\nBuilding RAM cache for {len(candidate_words)} candidates x {len(answers)} answers...")
+        patterns = precompute_candidate_patterns(answers, candidate_words)
+        # set globals for single-process code paths if needed
+        global _PATTERNS, _NUM_ANSWERS
+        _PATTERNS = patterns
+        _NUM_ANSWERS = len(answers)
+
+        # Show approximate RAM footprint (uint8)
+        approx_mb = (len(candidate_words) * len(answers)) / (1024 * 1024)
+        print(f"[cache] patterns table ≈ {approx_mb:.2f} MB (uint8)\n")
+
+    # Build initial beam (L1)
     level = []
+    cand_set = set(candidate_words)
     for H, w in single_entropies:
-        if w in set(candidate_words):
+        if w in cand_set:
             level.append((H, [w]))
     level.sort(reverse=True)
     level = level[:beam_width]
@@ -293,15 +419,28 @@ def search_best_starters(
             },
         )
 
+    # Iterate L2..max_len
     for L in range(2, max_len + 1):
         print(f"\nSearching best {L}-word starters...")
         tasks = []
-        for H_prev, seq in level:
-            used = set(seq)
-            base = tuple(seq)
-            for w in candidate_words:
-                if w not in used:
-                    tasks.append((base, w))
+
+        # Use indices when cached; words otherwise
+        if use_ram_cache:
+            level_idx = [(H, [word_to_cidx[w] for w in seq]) for H, seq in level]
+            for _, seq_idx in level_idx:
+                used = set(seq_idx)
+                base = tuple(seq_idx)
+                for new_idx in range(len(candidate_words)):
+                    if new_idx not in used:
+                        tasks.append((base, new_idx))
+        else:
+            for _, seq in level:
+                used = set(seq)
+                base = tuple(seq)
+                for w in candidate_words:
+                    if w not in used:
+                        tasks.append((base, w))
+
         total = len(tasks)
         if total == 0:
             print("No expansions possible.")
@@ -309,25 +448,61 @@ def search_best_starters(
 
         new_level = []
         start = time.time()
-        if n_jobs <= 1:
-            for i, (base, w) in enumerate(tasks, 1):
-                seq_list = list(base) + [w]
-                H = joint_entropy(seq_list, answers)
-                new_level.append((H, seq_list))
-                if i % 20 == 0 or i == total:
-                    elapsed = time.time() - start
-                    eta = (elapsed / i) * (total - i) if i > 0 else 0
-                    print(f"\r[L{L}] {i}/{total} | elapsed {tfmt(elapsed)} | ETA {tfmt(eta)}", end="", flush=True)
-            print()
+
+        if use_ram_cache:
+            # Cached joint entropy path (multiprocessing supported; patterns copied once per worker)
+            if n_jobs <= 1:
+                for i, (base_idx, new_idx) in enumerate(tasks, 1):
+                    seq_idx = tuple(base_idx) + (new_idx,)
+                    H = joint_entropy_cached(seq_idx)
+                    seq_words = [candidate_words[j] for j in seq_idx]
+                    new_level.append((H, seq_words))
+                    if i % 50 == 0 or i == total:
+                        elapsed = time.time() - start
+                        eta = (elapsed / i) * (total - i) if i > 0 else 0
+                        print(f"\r[L{L}] {i}/{total} | elapsed {tfmt(elapsed)} | ETA {tfmt(eta)}", end="", flush=True)
+                print()
+            else:
+                with mp.Pool(n_jobs, initializer=_joint_init_cached, initargs=(patterns, len(answers))) as pool:
+                    for i, (H, seq_idx) in enumerate(pool.imap_unordered(_joint_worker_cached, tasks), 1):
+                        seq_words = [candidate_words[j] for j in seq_idx]
+                        new_level.append((H, seq_words))
+                        if i % 50 == 0 or i == total:
+                            elapsed = time.time() - start
+                            eta = (elapsed / i) * (total - i) if i > 0 else 0
+                            print(f"\r[L{L}] {i}/{total} | elapsed {tfmt(elapsed)} | ETA {tfmt(eta)}", end="", flush=True)
+                print()
         else:
-            with mp.Pool(n_jobs, initializer=_joint_init, initargs=(answers,)) as pool:
-                for i, (H, seq_tuple) in enumerate(pool.imap_unordered(_joint_worker, tasks), 1):
-                    new_level.append((H, list(seq_tuple)))
+            # Old slow path
+            if n_jobs <= 1:
+                for i, (base, w) in enumerate(tasks, 1):
+                    seq_list = list(base) + [w]
+                    H = joint_entropy(seq_list, answers)
+                    new_level.append((H, seq_list))
                     if i % 20 == 0 or i == total:
                         elapsed = time.time() - start
                         eta = (elapsed / i) * (total - i) if i > 0 else 0
                         print(f"\r[L{L}] {i}/{total} | elapsed {tfmt(elapsed)} | ETA {tfmt(eta)}", end="", flush=True)
-            print()
+                print()
+            else:
+                # keep original mp path for slow mode
+                def _joint_init_slow(answers_):
+                    global _ENTROPY_ANSWERS
+                    _ENTROPY_ANSWERS = answers_
+
+                def _joint_worker_slow(args_):
+                    base_seq, new_word = args_
+                    seq_ = list(base_seq) + [new_word]
+                    return joint_entropy(seq_, _ENTROPY_ANSWERS), tuple(seq_)
+
+                with mp.Pool(n_jobs, initializer=_joint_init_slow, initargs=(answers,)) as pool:
+                    for i, (H, seq_tuple) in enumerate(pool.imap_unordered(_joint_worker_slow, tasks), 1):
+                        new_level.append((H, list(seq_tuple)))
+                        if i % 20 == 0 or i == total:
+                            elapsed = time.time() - start
+                            eta = (elapsed / i) * (total - i) if i > 0 else 0
+                            print(f"\r[L{L}] {i}/{total} | elapsed {tfmt(elapsed)} | ETA {tfmt(eta)}", end="", flush=True)
+                print()
 
         new_level.sort(reverse=True)
         level = new_level[:beam_width]
@@ -350,6 +525,7 @@ def search_best_starters(
                     "top_m_words": top_m_words,
                     "elapsed_sec_level": round(time.time() - start, 6),
                     "elapsed_sec_total": round(time.time() - run_start, 6),
+                    "use_ram_cache": use_ram_cache,
                 },
             )
 
@@ -365,6 +541,7 @@ def search_best_starters(
                 "top_print": top_print,
                 "n_jobs": n_jobs,
                 "first_entropy_file": first_entropy_file,
+                "use_ram_cache": use_ram_cache,
                 "finished_epoch": int(time.time()),
                 "total_elapsed_sec": round(time.time() - run_start, 6),
             },
@@ -372,18 +549,8 @@ def search_best_starters(
         print(f"\nSaved run state to: {save_dir}")
 
 
-def _pair_init(answers):
-    global _JOINT_ANSWERS
-    _JOINT_ANSWERS = answers
-
-
-def _pair_worker(args):
-    first, second = args
-    H = joint_entropy([first, second], _JOINT_ANSWERS)
-    return first, second, H
-
-
 def exhaustive_pair_search(allowed_words, answers, top_m_words, out_csv, n_jobs, pair_dissimilar_only, max_overlap, first_entropy_file):
+    # Left as-is (can be upgraded similarly if you want)
     single_entropies, ent_dict = get_single_entropies(allowed_words, answers, n_jobs, first_entropy_file)
     seeds = [w for _, w in single_entropies[:top_m_words]]
     letter_sets = {w: set(w) for w in allowed_words}
@@ -415,14 +582,23 @@ def exhaustive_pair_search(allowed_words, answers, top_m_words, out_csv, n_jobs,
                 print(f"\r[Pairs] {i}/{total} | elapsed {tfmt(elapsed)} | ETA {tfmt(eta)}", end="", flush=True)
         print()
     else:
-        with mp.Pool(n_jobs, initializer=_pair_init, initargs=(answers,)) as pool:
-            for i, (first, second, H) in enumerate(pool.imap_unordered(_pair_worker, tasks), 1):
+        def _pair_init_slow(answers_):
+            global _ENTROPY_ANSWERS
+            _ENTROPY_ANSWERS = answers_
+
+        def _pair_worker_slow(args_):
+            first_, second_ = args_
+            return first_, second_, joint_entropy([first_, second_], _ENTROPY_ANSWERS)
+
+        with mp.Pool(n_jobs, initializer=_pair_init_slow, initargs=(answers,)) as pool:
+            for i, (first, second, H) in enumerate(pool.imap_unordered(_pair_worker_slow, tasks), 1):
                 results.append((H, first, second))
                 if i % 50 == 0 or i == total:
                     elapsed = time.time() - start
                     eta = (elapsed / i) * (total - i) if i > 0 else 0
                     print(f"\r[Pairs] {i}/{total} | elapsed {tfmt(elapsed)} | ETA {tfmt(eta)}", end="", flush=True)
         print()
+
     results.sort(reverse=True)
     print("\n=== Top 20 pairs ===")
     for H, first, second in results[:20]:
@@ -455,6 +631,7 @@ def main():
     p.add_argument("--save-dir", default=None)
     p.add_argument("--save-prefix", default=None)
     p.add_argument("--save-top-only", action="store_true")
+    p.add_argument("--no-ram-cache", action="store_true", help="Disable RAM cache and use slow joint_entropy()")
     args = p.parse_args()
 
     allowed = load_words(args.dictionary)
@@ -474,6 +651,7 @@ def main():
             out_dir=args.save_dir,
             out_prefix=args.save_prefix,
             save_top_print_only=args.save_top_only,
+            use_ram_cache=(not args.no_ram_cache),
         )
     elif args.mode == "eval":
         if not args.starter:
@@ -483,7 +661,7 @@ def main():
             if w not in allowed:
                 raise SystemExit(f"Starter word {w} not in dictionary")
         t0 = time.time()
-        H = joint_entropy(seq, answers)
+        H = joint_entropy(seq, answers)  # eval keeps simple, slow but fine for one sequence
         print(f"Starter: {' '.join(seq)}")
         print(f"Entropy: {H:.6f} bits")
         print(f"Time: {tfmt(time.time() - t0)}")
@@ -502,3 +680,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
